@@ -219,23 +219,28 @@ class AgencyZoomExtractor:
 
             # Login first
             print("[AgencyZoom SMS] Navigating to login page...")
-            await page.goto("https://app.agencyzoom.com/login", wait_until="networkidle")
+            await page.goto("https://app.agencyzoom.com/login", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(2)
 
-            # Fill login form
-            email_field = await page.wait_for_selector("input[name='email'], input[type='email'], #email", timeout=10000)
+            # Fill login form - AgencyZoom uses LoginForm[username] and LoginForm[password]
+            email_field = await page.wait_for_selector(
+                "input[name='LoginForm[username]'], input[name='email'], input[type='email']",
+                timeout=30000
+            )
             if not email_field:
                 return {"success": False, "error": "Could not find email field"}
             await email_field.fill(email)
 
-            password_field = await page.query_selector("input[name='password'], input[type='password'], #password")
+            password_field = await page.query_selector(
+                "input[name='LoginForm[password]'], input[name='password'], input[type='password']"
+            )
             if not password_field:
                 return {"success": False, "error": "Could not find password field"}
             await password_field.fill(password)
 
             # Submit login
             await password_field.press("Enter")
-            await asyncio.sleep(5)
+            await asyncio.sleep(8)
 
             # Check login success
             if "login" in page.url.lower():
@@ -244,7 +249,7 @@ class AgencyZoomExtractor:
             print("[AgencyZoom SMS] Login successful, navigating to messages...")
 
             # Navigate to Messages page
-            await page.goto("https://app.agencyzoom.com/integration/messages/index", wait_until="networkidle")
+            await page.goto("https://app.agencyzoom.com/integration/messages/index", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
 
             # Step 1: Click "Add" button
