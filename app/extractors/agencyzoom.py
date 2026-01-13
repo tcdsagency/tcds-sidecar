@@ -208,30 +208,6 @@ class AgencyZoomExtractor:
             if not result.get("success"):
                 return {"success": False, "error": "Could not get session"}
 
-        # Extract agent ID from JWT cookie (NOT user ID - agent ID is required for SMS)
-        agent_id = ""
-        jwt_token = ""
-        for c in self._cached_cookies:
-            if c["name"] == "jwt":
-                jwt_token = c["value"]
-                try:
-                    # JWT format: header.payload.signature
-                    payload = jwt_token.split(".")[1]
-                    # Add padding if needed
-                    payload += "=" * (4 - len(payload) % 4)
-                    decoded = base64.b64decode(payload)
-                    jwt_data = json_module.loads(decoded)
-                    jti = jwt_data.get("jti", {})
-                    # Agent ID is in "agent" field (base64 encoded) - this is what SMS needs
-                    agent_encoded = jti.get("agent", "")
-                    if agent_encoded:
-                        agent_id = base64.b64decode(agent_encoded + "==").decode()
-                    print(f"[AgencyZoom SMS] JWT jti: {jti}")
-                    print(f"[AgencyZoom SMS] Extracted agent ID: {agent_id}")
-                except Exception as e:
-                    print(f"[AgencyZoom SMS] Could not extract agent ID: {e}")
-                break
-
         # Build cookie header string
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self._cached_cookies])
 
@@ -254,15 +230,22 @@ class AgencyZoomExtractor:
                 if csrf_token:
                     headers["X-CSRF-Token"] = csrf_token
 
-                # Payload per the diagram - UserId should be the AGENT ID
+                # Correct payload format for AgencyZoom internal SMS API
                 payload = {
-                    "PhoneNumber": normalized_phone,
-                    "UserId": agent_id,
-                    "Message": message,
-                    "FromName": "TCDS Agency"
+                    "sendType": "single",
+                    "referer": "/integration/messages/index",
+                    "linkToType": "",  # Empty if no contact to link
+                    "linkToId": [],
+                    "serviceTicketId": "",
+                    "from": "TCDS Agency",
+                    "phoneNumbers": [normalized_phone],  # Array of phone numbers (digits only)
+                    "actionType": "41",  # SMS action code
+                    "message": message,
+                    "files": [],
+                    "unsubscribe": "off"
                 }
 
-                print(f"[AgencyZoom SMS] Sending HTTP request with UserId(agentId)={agent_id}...")
+                print(f"[AgencyZoom SMS] Sending to phoneNumbers={payload['phoneNumbers']}...")
                 print(f"[AgencyZoom SMS] CSRF Token: {csrf_token[:50] if csrf_token else 'None'}...")
 
                 async with session.post(
@@ -277,17 +260,23 @@ class AgencyZoomExtractor:
                     if resp.status == 200:
                         try:
                             data = json_module.loads(text)
-                            # Check if there's an actual SMS ID returned
-                            if data.get("id"):
-                                print(f"[AgencyZoom SMS] SMS sent with ID: {data.get('id')}")
-                                return {"success": True, "sms_id": data.get("id")}
+                            # Check if there's an actual SMS ID returned (id: null means fake success)
+                            sms_id = data.get("id")
+                            if sms_id is not None and sms_id != "null":
+                                print(f"[AgencyZoom SMS] SMS sent with ID: {sms_id}")
+                                return {"success": True, "sms_id": sms_id}
                             elif data.get("result") == True:
-                                # This is the "fake success" - returns true but no ID
-                                print("[AgencyZoom SMS] Got result=true but no ID - may be fake success")
-                                return {"success": True, "warning": "No SMS ID returned"}
+                                # result=true but id=null means the message was queued but we can't verify
+                                print(f"[AgencyZoom SMS] Result: {data}")
+                                return {"success": True, "warning": "No SMS ID returned", "response": data}
                             else:
                                 return {"success": False, "error": data.get("message", text)}
                         except:
+                            # If response is HTML (login page), session expired
+                            if "<html" in text.lower():
+                                self._cached_cookies = None
+                                self._cached_csrf = None
+                                return {"success": False, "error": "Session expired - got HTML instead of JSON"}
                             return {"success": False, "error": f"Invalid response: {text[:100]}"}
                     else:
                         return {"success": False, "error": f"HTTP {resp.status}: {text[:100]}"}

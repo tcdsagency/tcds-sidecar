@@ -138,32 +138,43 @@ async def send_sms(request: SMSRequest):
 
         await asyncio.sleep(2)
 
-        # Step 5: Enter phone number using JS to avoid viewport issues
-        print(f"[SMS] Step 5: Enter phone {phone}")
-        phone_entered = await page.evaluate(f"""() => {{
-            const tagify = document.querySelector('.tagify__input');
-            if (tagify) {{
-                tagify.scrollIntoView();
-                tagify.click();
-                tagify.focus();
-                // Simulate typing by creating and dispatching input event
-                tagify.textContent = '{phone}';
-                tagify.dispatchEvent(new InputEvent('input', {{bubbles: true, data: '{phone}'}}));
-                // Press Enter
-                tagify.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}}));
-                return true;
-            }}
-            return false;
-        }}""")
+        # Step 5: Search and select customer by phone in the dropdown
+        print(f"[SMS] Step 5: Search for customer by phone {phone}")
 
-        if not phone_entered:
-            # Fallback to regular input
-            await page.evaluate(f"""() => {{
-                const inp = document.querySelector('input[name="recipients"]');
-                if (inp) {{ inp.value = '{phone}'; inp.dispatchEvent(new Event('input', {{bubbles:true}})); }}
-            }}""")
+        # Format phone for search: (205) 799-6639
+        if len(phone) == 11 and phone.startswith('1'):
+            display_phone = f"({phone[1:4]}) {phone[4:7]}-{phone[7:]}"
+        elif len(phone) == 10:
+            display_phone = f"({phone[0:3]}) {phone[3:6]}-{phone[6:]}"
+        else:
+            display_phone = phone
 
-        await asyncio.sleep(1.5)
+        print(f"[SMS] Searching for: {display_phone}")
+
+        # Click the Customer dropdown to open it
+        await page.evaluate("""() => {
+            const select2 = document.querySelector('.select2-container')
+                || document.querySelector('[class*="select2"]');
+            if (select2) { select2.click(); }
+        }""")
+        await asyncio.sleep(0.5)
+
+        # Type the phone number in the search box
+        search_input = await page.query_selector(".select2-search__field, .select2-search input, input.select2-input")
+        if search_input:
+            await search_input.fill(display_phone)
+        else:
+            # Fallback: just type (search should be focused)
+            await page.keyboard.type(display_phone, delay=50)
+
+        await asyncio.sleep(2)  # Wait for results to load
+
+        # Take screenshot of search results
+        await page.screenshot(path="/tmp/customer_search.png")
+
+        # Press Enter to select first result
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(1)
 
         # Step 6: Enter message
         print("[SMS] Step 6: Enter message")
