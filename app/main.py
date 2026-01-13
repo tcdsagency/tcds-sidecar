@@ -5,6 +5,7 @@ Unified Python service for browser automation and token extraction.
 
 Endpoints:
 - POST /agencyzoom/session  - Get AgencyZoom cookies + CSRF token
+- POST /agencyzoom/sms      - Send SMS via AgencyZoom browser automation
 - POST /rpr/token           - Get RPR JWT token
 - POST /mmi/token           - Get MMI bearer token
 - POST /delphi/chat         - Chat with Delphi AI
@@ -36,6 +37,14 @@ from app.extractors.delphi import DelphiProxy
 
 class ChatRequest(BaseModel):
     message: str
+
+class SMSRequest(BaseModel):
+    phone_number: str
+    message: str
+
+class SMSResponse(BaseModel):
+    success: bool
+    error: Optional[str] = None
 
 class TokenResponse(BaseModel):
     success: bool
@@ -162,7 +171,7 @@ async def get_agencyzoom_session(force_refresh: bool = False):
     Required for SMS endpoint which rejects JWT tokens.
     """
     cache_key = "agencyzoom"
-    
+
     # Check cache
     if not force_refresh:
         cached = get_cached(cache_key)
@@ -173,7 +182,7 @@ async def get_agencyzoom_session(force_refresh: bool = False):
                 fromCache=True,
                 expiresAt=cached["expiresAt"]
             )
-    
+
     # Extract fresh session
     try:
         result = await agencyzoom_extractor.extract()
@@ -192,6 +201,27 @@ async def get_agencyzoom_session(force_refresh: bool = False):
             )
     except Exception as e:
         return TokenResponse(success=False, error=str(e))
+
+
+@app.post("/agencyzoom/sms", response_model=SMSResponse)
+async def send_agencyzoom_sms(request: SMSRequest):
+    """
+    Send SMS via AgencyZoom using browser automation.
+    This navigates to the AgencyZoom Messages page and sends through the UI.
+    """
+    try:
+        print(f"[SMS] Sending to {request.phone_number}: {request.message[:50]}...")
+        result = await agencyzoom_extractor.send_sms(
+            phone_number=request.phone_number,
+            message=request.message
+        )
+        return SMSResponse(
+            success=result.get("success", False),
+            error=result.get("error")
+        )
+    except Exception as e:
+        print(f"[SMS] Error: {e}")
+        return SMSResponse(success=False, error=str(e))
 
 
 @app.post("/rpr/token", response_model=TokenResponse)
