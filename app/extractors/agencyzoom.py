@@ -233,13 +233,8 @@ class AgencyZoomExtractor:
         # Build cookie header string
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self._cached_cookies])
 
-        # Get CSRF from _csrf cookie if available
+        # Use CSRF token from meta tag (not cookie - cookie is URL-encoded data)
         csrf_token = self._cached_csrf or ""
-        for c in self._cached_cookies:
-            if c["name"] == "_csrf":
-                # The _csrf cookie value contains the token
-                csrf_token = c["value"]
-                break
 
         try:
             async with aiohttp.ClientSession() as session:
