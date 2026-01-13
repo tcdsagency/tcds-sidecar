@@ -208,8 +208,8 @@ class AgencyZoomExtractor:
             if not result.get("success"):
                 return {"success": False, "error": "Could not get session"}
 
-        # Extract user ID from JWT cookie
-        user_id = ""
+        # Extract agent ID from JWT cookie (NOT user ID - agent ID is required for SMS)
+        agent_id = ""
         jwt_token = ""
         for c in self._cached_cookies:
             if c["name"] == "jwt":
@@ -221,13 +221,15 @@ class AgencyZoomExtractor:
                     payload += "=" * (4 - len(payload) % 4)
                     decoded = base64.b64decode(payload)
                     jwt_data = json_module.loads(decoded)
-                    # User ID is in the "u" field (base64 encoded)
-                    u_encoded = jwt_data.get("jti", {}).get("u", "")
-                    if u_encoded:
-                        user_id = base64.b64decode(u_encoded + "==").decode()
-                    print(f"[AgencyZoom SMS] Extracted user ID: {user_id}")
+                    jti = jwt_data.get("jti", {})
+                    # Agent ID is in "agent" field (base64 encoded) - this is what SMS needs
+                    agent_encoded = jti.get("agent", "")
+                    if agent_encoded:
+                        agent_id = base64.b64decode(agent_encoded + "==").decode()
+                    print(f"[AgencyZoom SMS] JWT jti: {jti}")
+                    print(f"[AgencyZoom SMS] Extracted agent ID: {agent_id}")
                 except Exception as e:
-                    print(f"[AgencyZoom SMS] Could not extract user ID: {e}")
+                    print(f"[AgencyZoom SMS] Could not extract agent ID: {e}")
                 break
 
         # Build cookie header string
@@ -252,15 +254,15 @@ class AgencyZoomExtractor:
                 if csrf_token:
                     headers["X-CSRF-Token"] = csrf_token
 
-                # Payload per the diagram
+                # Payload per the diagram - UserId should be the AGENT ID
                 payload = {
                     "PhoneNumber": normalized_phone,
-                    "UserId": user_id,
+                    "UserId": agent_id,
                     "Message": message,
                     "FromName": "TCDS Agency"
                 }
 
-                print(f"[AgencyZoom SMS] Sending HTTP request with UserId={user_id}...")
+                print(f"[AgencyZoom SMS] Sending HTTP request with UserId(agentId)={agent_id}...")
                 print(f"[AgencyZoom SMS] CSRF Token: {csrf_token[:50] if csrf_token else 'None'}...")
 
                 async with session.post(
