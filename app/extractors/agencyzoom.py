@@ -182,8 +182,7 @@ class AgencyZoomExtractor:
 
     async def send_sms(self, phone_number: str, message: str) -> Dict[str, Any]:
         """
-        Send SMS through AgencyZoom using full browser automation.
-        The HTTP API returns fake success, so we must use the actual UI.
+        Send SMS through AgencyZoom using HTTP API with session cookies.
 
         Args:
             phone_number: Recipient phone number (will be normalized)
@@ -192,149 +191,112 @@ class AgencyZoomExtractor:
         Returns:
             {"success": True/False, "error": "..." (if failed)}
         """
-        email = os.getenv("AGENCYZOOM_EMAIL") or os.getenv("AGENCYZOOM_API_USERNAME")
-        password = os.getenv("AGENCYZOOM_PASSWORD") or os.getenv("AGENCYZOOM_API_PASSWORD")
-
-        if not email or not password:
-            return {"success": False, "error": "AGENCYZOOM credentials required"}
+        import base64
+        import json as json_module
 
         # Normalize phone number
         normalized_phone = ''.join(c for c in phone_number if c.isdigit())
         if len(normalized_phone) == 10:
             normalized_phone = '1' + normalized_phone
 
-        print(f"[AgencyZoom SMS] Starting browser automation for {normalized_phone}")
+        print(f"[AgencyZoom SMS] Preparing to send to {normalized_phone}")
+
+        # Get fresh session if needed
+        if not self._cached_cookies:
+            print("[AgencyZoom SMS] No cached cookies, extracting session...")
+            result = await self.extract()
+            if not result.get("success"):
+                return {"success": False, "error": "Could not get session"}
+
+        # Extract user ID from JWT cookie
+        user_id = ""
+        jwt_token = ""
+        for c in self._cached_cookies:
+            if c["name"] == "jwt":
+                jwt_token = c["value"]
+                try:
+                    # JWT format: header.payload.signature
+                    payload = jwt_token.split(".")[1]
+                    # Add padding if needed
+                    payload += "=" * (4 - len(payload) % 4)
+                    decoded = base64.b64decode(payload)
+                    jwt_data = json_module.loads(decoded)
+                    # User ID is in the "u" field (base64 encoded)
+                    u_encoded = jwt_data.get("jti", {}).get("u", "")
+                    if u_encoded:
+                        user_id = base64.b64decode(u_encoded + "==").decode()
+                    print(f"[AgencyZoom SMS] Extracted user ID: {user_id}")
+                except Exception as e:
+                    print(f"[AgencyZoom SMS] Could not extract user ID: {e}")
+                break
+
+        # Build cookie header string
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self._cached_cookies])
+
+        # Get CSRF from _csrf cookie if available
+        csrf_token = self._cached_csrf or ""
+        for c in self._cached_cookies:
+            if c["name"] == "_csrf":
+                # The _csrf cookie value contains the token
+                csrf_token = c["value"]
+                break
 
         try:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Cookie": cookie_str,
+                    "Origin": "https://app.agencyzoom.com",
+                    "Referer": "https://app.agencyzoom.com/integration/messages/index",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
 
-            # Set default timeout to 60 seconds for all operations
-            context = await self.browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            context.set_default_timeout(60000)
-            page = await context.new_page()
+                # Add CSRF token
+                if csrf_token:
+                    headers["X-CSRF-Token"] = csrf_token
 
-            # Step 1: Login
-            print("[AgencyZoom SMS] Step 1: Logging in...")
-            await page.goto("https://app.agencyzoom.com/login", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
+                # Payload per the diagram
+                payload = {
+                    "PhoneNumber": normalized_phone,
+                    "UserId": user_id,
+                    "Message": message,
+                    "FromName": "TCDS Agency"
+                }
 
-            # Find and fill email
-            email_selectors = ["input[name='LoginForm[username]']", "input[name='email']", "input[type='email']"]
-            for sel in email_selectors:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(email)
-                        print(f"[AgencyZoom SMS] Filled email using {sel}")
-                        break
-                except:
-                    continue
+                print(f"[AgencyZoom SMS] Sending HTTP request with UserId={user_id}...")
+                print(f"[AgencyZoom SMS] CSRF Token: {csrf_token[:50] if csrf_token else 'None'}...")
 
-            # Find and fill password
-            pw_selectors = ["input[name='LoginForm[password]']", "input[name='password']", "input[type='password']"]
-            for sel in pw_selectors:
-                try:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(password)
-                        await el.press("Enter")
-                        print(f"[AgencyZoom SMS] Submitted login using {sel}")
-                        break
-                except:
-                    continue
+                async with session.post(
+                    "https://app.agencyzoom.com/integration/sms/send-text",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    text = await resp.text()
+                    print(f"[AgencyZoom SMS] Response {resp.status}: {text}")
 
-            # Wait for login to complete
-            await asyncio.sleep(6)
-            if "login" in page.url.lower():
-                return {"success": False, "error": "Login failed"}
-            print("[AgencyZoom SMS] Login successful")
+                    if resp.status == 200:
+                        try:
+                            data = json_module.loads(text)
+                            # Check if there's an actual SMS ID returned
+                            if data.get("id"):
+                                print(f"[AgencyZoom SMS] SMS sent with ID: {data.get('id')}")
+                                return {"success": True, "sms_id": data.get("id")}
+                            elif data.get("result") == True:
+                                # This is the "fake success" - returns true but no ID
+                                print("[AgencyZoom SMS] Got result=true but no ID - may be fake success")
+                                return {"success": True, "warning": "No SMS ID returned"}
+                            else:
+                                return {"success": False, "error": data.get("message", text)}
+                        except:
+                            return {"success": False, "error": f"Invalid response: {text[:100]}"}
+                    else:
+                        return {"success": False, "error": f"HTTP {resp.status}: {text[:100]}"}
 
-            # Step 2: Navigate to messages
-            print("[AgencyZoom SMS] Step 2: Going to messages page...")
-            await page.goto("https://app.agencyzoom.com/integration/messages/index", wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-
-            # Step 3: Click Add button
-            print("[AgencyZoom SMS] Step 3: Clicking Add...")
-            await page.evaluate("""() => {
-                const btn = document.querySelector('button.btn-success, a.btn-success')
-                    || Array.from(document.querySelectorAll('button, a')).find(e => e.textContent.includes('Add'));
-                if (btn) btn.click();
-            }""")
-            await asyncio.sleep(1.5)
-
-            # Step 4: Click "Send a Text"
-            print("[AgencyZoom SMS] Step 4: Clicking Send a Text...")
-            await page.evaluate("""() => {
-                const link = Array.from(document.querySelectorAll('a')).find(a =>
-                    a.textContent.includes('Send a Text') || a.textContent.includes('Send Text') || a.href?.includes('send-text'));
-                if (link) link.click();
-            }""")
-            await asyncio.sleep(2)
-
-            # Step 5: Enter phone number
-            print(f"[AgencyZoom SMS] Step 5: Entering phone {normalized_phone}...")
-            # Try tagify input first
-            tagify = await page.query_selector(".tagify__input")
-            if tagify:
-                await tagify.click()
-                await tagify.type(normalized_phone, delay=50)
-                await asyncio.sleep(0.5)
-                await page.keyboard.press("Enter")
-            else:
-                # Try regular input
-                await page.evaluate(f"""() => {{
-                    const inp = document.querySelector('input[name="recipients"]') || document.querySelector('.tagify input');
-                    if (inp) {{ inp.value = '{normalized_phone}'; inp.dispatchEvent(new Event('input', {{bubbles:true}})); }}
-                }}""")
-            await asyncio.sleep(1)
-
-            # Step 6: Enter message
-            print("[AgencyZoom SMS] Step 6: Entering message...")
-            safe_msg = message.replace("'", "\\'").replace("\n", " ")
-            await page.evaluate(f"""() => {{
-                const ta = document.getElementById('textMessage') || document.querySelector('textarea[name="message"]') || document.querySelector('textarea');
-                if (ta) {{
-                    ta.value = '{safe_msg}';
-                    ta.dispatchEvent(new Event('input', {{bubbles:true}}));
-                    ta.dispatchEvent(new Event('change', {{bubbles:true}}));
-                }}
-            }}""")
-            await asyncio.sleep(1)
-
-            # Step 7: Click Send
-            print("[AgencyZoom SMS] Step 7: Clicking Send...")
-            await page.evaluate("""() => {
-                const btn = document.getElementById('send-text-btn')
-                    || document.querySelector('button[type="submit"]')
-                    || Array.from(document.querySelectorAll('button')).find(b => b.textContent.toLowerCase().includes('send'));
-                if (btn) btn.click();
-            }""")
-            await asyncio.sleep(3)
-
-            # Check for errors
-            error_el = await page.query_selector(".alert-danger:visible, .toast-error:visible")
-            if error_el:
-                err_text = await error_el.inner_text()
-                return {"success": False, "error": f"AgencyZoom error: {err_text}"}
-
-            print("[AgencyZoom SMS] SMS sent successfully!")
-            return {"success": True}
-
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
         except Exception as e:
             print(f"[AgencyZoom SMS] Error: {e}")
             return {"success": False, "error": str(e)}
-
-        finally:
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-            self.browser = None
-            self.playwright = None
