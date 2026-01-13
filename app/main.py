@@ -206,11 +206,19 @@ async def get_agencyzoom_session(force_refresh: bool = False):
 @app.post("/agencyzoom/sms", response_model=SMSResponse)
 async def send_agencyzoom_sms(request: SMSRequest):
     """
-    Send SMS via AgencyZoom using browser automation.
-    This navigates to the AgencyZoom Messages page and sends through the UI.
+    Send SMS via AgencyZoom using HTTP with session cookies.
+    Uses cached session if available, otherwise extracts fresh session.
     """
     try:
         print(f"[SMS] Sending to {request.phone_number}: {request.message[:50]}...")
+
+        # Prime extractor's cache from our token_cache if available
+        cached = get_cached("agencyzoom")
+        if cached and cached.get("cookies"):
+            agencyzoom_extractor._cached_cookies = cached.get("cookies")
+            agencyzoom_extractor._cached_csrf = cached.get("csrfToken")
+            print("[SMS] Using cached session from token_cache")
+
         result = await agencyzoom_extractor.send_sms(
             phone_number=request.phone_number,
             message=request.message
