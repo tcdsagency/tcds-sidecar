@@ -2,22 +2,25 @@
 AgencyZoom Session Extractor
 ============================
 Extracts session cookies and CSRF token for SMS endpoint.
-Also provides SMS sending via browser automation.
+Also provides SMS sending via HTTP with session cookies.
 The /integration/sms/send-text endpoint requires session cookies, not JWT.
 """
 
 import os
 import asyncio
-from typing import Dict, Any, Optional
+import aiohttp
+from typing import Dict, Any, Optional, List
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
 
 class AgencyZoomExtractor:
     """Extract AgencyZoom session cookies via browser automation"""
-    
+
     def __init__(self):
         self.browser: Optional[Browser] = None
         self.playwright = None
+        self._cached_cookies: Optional[List[Dict[str, Any]]] = None
+        self._cached_csrf: Optional[str] = None
     
     async def extract(self) -> Dict[str, Any]:
         """
@@ -151,14 +154,18 @@ class AgencyZoomExtractor:
             ]
             
             print(f"[AgencyZoom] Extracted {len(cookie_list)} cookies")
-            
+
+            # Cache cookies for SMS sending
+            self._cached_cookies = cookie_list
+            self._cached_csrf = csrf_token
+
             result = {
                 "success": True,
                 "cookies": cookie_list,
             }
             if csrf_token:
                 result["csrfToken"] = csrf_token
-            
+
             return result
             
         except Exception as e:
@@ -173,9 +180,21 @@ class AgencyZoomExtractor:
             self.browser = None
             self.playwright = None
 
+    async def _get_cookies(self) -> Optional[List[Dict[str, Any]]]:
+        """Get cookies from cache or extract fresh ones."""
+        if self._cached_cookies:
+            print("[AgencyZoom SMS] Using cached cookies")
+            return self._cached_cookies
+
+        print("[AgencyZoom SMS] No cached cookies, extracting fresh session...")
+        result = await self.extract()
+        if result.get("success"):
+            return self._cached_cookies
+        return None
+
     async def send_sms(self, phone_number: str, message: str) -> Dict[str, Any]:
         """
-        Send SMS through AgencyZoom's web interface using browser automation.
+        Send SMS through AgencyZoom using HTTP with session cookies.
 
         Args:
             phone_number: Recipient phone number (will be normalized)
@@ -184,198 +203,104 @@ class AgencyZoomExtractor:
         Returns:
             {"success": True/False, "error": "..." (if failed)}
         """
-        email = os.getenv("AGENCYZOOM_EMAIL") or os.getenv("AGENCYZOOM_API_USERNAME")
-        password = os.getenv("AGENCYZOOM_PASSWORD") or os.getenv("AGENCYZOOM_API_PASSWORD")
-
-        if not email or not password:
-            return {
-                "success": False,
-                "error": "AGENCYZOOM_EMAIL and AGENCYZOOM_PASSWORD required"
-            }
-
-        # Normalize phone number
+        # Normalize phone number - AgencyZoom expects format like "12056173229"
         normalized_phone = ''.join(c for c in phone_number if c.isdigit())
         if len(normalized_phone) == 10:
             normalized_phone = '1' + normalized_phone
-        elif normalized_phone.startswith('1') and len(normalized_phone) == 11:
-            pass  # Already has country code
+
+        print(f"[AgencyZoom SMS] Preparing to send to {normalized_phone}")
+
+        # Get cookies (cached or fresh)
+        cookies = await self._get_cookies()
+        if not cookies:
+            return {"success": False, "error": "Could not get session cookies"}
+
+        # Build cookie jar for aiohttp
+        jar = aiohttp.CookieJar()
+        for c in cookies:
+            jar.update_cookies({c["name"]: c["value"]})
+
+        # Build cookie header string
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
         try:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                ]
-            )
-
-            context = await self.browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            page = await context.new_page()
-
-            # Login first
-            print("[AgencyZoom SMS] Navigating to login page...")
-            await page.goto("https://app.agencyzoom.com/login", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(2)
-
-            # Fill login form - try multiple selectors like extract() does
-            print("[AgencyZoom SMS] Looking for email field...")
-            email_field = None
-            for selector in ["input[name='LoginForm[username]']", "input[name='email']", "input[type='email']", "#email"]:
-                try:
-                    email_field = await page.wait_for_selector(selector, timeout=5000)
-                    if email_field:
-                        print(f"[AgencyZoom SMS] Found email field with: {selector}")
-                        break
-                except:
-                    continue
-
-            if not email_field:
-                return {"success": False, "error": "Could not find email field"}
-            await email_field.fill(email)
-
-            # Find password field
-            password_field = None
-            for selector in ["input[name='LoginForm[password]']", "input[name='password']", "input[type='password']", "#password"]:
-                try:
-                    password_field = await page.query_selector(selector)
-                    if password_field:
-                        break
-                except:
-                    continue
-
-            if not password_field:
-                return {"success": False, "error": "Could not find password field"}
-            await password_field.fill(password)
-
-            # Submit login
-            print("[AgencyZoom SMS] Submitting login...")
-            await password_field.press("Enter")
-            await asyncio.sleep(8)
-
-            # Check login success
-            if "login" in page.url.lower():
-                return {"success": False, "error": "Login failed"}
-
-            print("[AgencyZoom SMS] Login successful, navigating to messages...")
-
-            # Navigate to Messages page
-            await page.goto("https://app.agencyzoom.com/integration/messages/index", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(3)
-
-            # Step 1: Click "Add" button
-            print("[AgencyZoom SMS] Clicking Add button...")
-            add_clicked = await page.evaluate("""
-                () => {
-                    const addBtn = Array.from(document.querySelectorAll('button, a'))
-                        .find(el => el.textContent.trim() === 'Add' || el.textContent.includes('Add'));
-                    if (addBtn) { addBtn.click(); return true; }
-                    return false;
+            async with aiohttp.ClientSession() as session:
+                # Try the send-text endpoint with session cookies
+                # The endpoint is at /integration/sms/send-text
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Cookie": cookie_str,
+                    "Origin": "https://app.agencyzoom.com",
+                    "Referer": "https://app.agencyzoom.com/integration/messages/index",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "X-Requested-With": "XMLHttpRequest",
                 }
-            """)
-            if not add_clicked:
-                return {"success": False, "error": "Could not find Add button"}
-            await asyncio.sleep(1)
 
-            # Step 2: Click "Send a Text" link
-            print("[AgencyZoom SMS] Clicking 'Send a Text'...")
-            send_text_clicked = await page.evaluate("""
-                () => {
-                    const link = Array.from(document.querySelectorAll('a'))
-                        .find(a => a.textContent.includes('Send a Text') || a.textContent.includes('Send Text'));
-                    if (link) { link.click(); return true; }
-                    return false;
+                # Add CSRF token if we have it
+                if self._cached_csrf:
+                    headers["X-CSRF-Token"] = self._cached_csrf
+
+                # Try the API endpoint format AgencyZoom expects
+                payload = {
+                    "PhoneNumber": normalized_phone,
+                    "Message": message,
+                    "UserId": "",  # Empty for system
+                    "FromName": "TCDS Agency"
                 }
-            """)
-            if not send_text_clicked:
-                return {"success": False, "error": "Could not find 'Send a Text' option"}
-            await asyncio.sleep(2)
 
-            # Step 3: Enter phone number in tagify input
-            print(f"[AgencyZoom SMS] Entering phone number: {normalized_phone}")
+                print(f"[AgencyZoom SMS] Sending HTTP request...")
+                async with session.post(
+                    "https://app.agencyzoom.com/integration/sms/send-text",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    text = await resp.text()
+                    print(f"[AgencyZoom SMS] Response: {resp.status} - {text[:200]}")
 
-            # Try to find and interact with tagify input
-            tagify_input = await page.query_selector(".tagify__input")
-            if tagify_input:
-                await tagify_input.click()
-                await asyncio.sleep(0.5)
-                await tagify_input.type(normalized_phone)
-                await asyncio.sleep(1)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(1)
-            else:
-                # Fallback: try direct input
-                await page.evaluate(f"""
-                    () => {{
-                        const input = document.querySelector('input[name="recipients"]')
-                            || document.querySelector('.tagify input');
-                        if (input) {{
-                            input.value = '{normalized_phone}';
-                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        }}
-                    }}
-                """)
+                    if resp.status == 200:
+                        try:
+                            data = await resp.json()
+                            if data.get("result") or data.get("success"):
+                                print("[AgencyZoom SMS] SMS sent successfully!")
+                                return {"success": True}
+                            else:
+                                return {"success": False, "error": data.get("message", "Unknown error")}
+                        except:
+                            # If response isn't JSON, check if it looks like success
+                            if "success" in text.lower() or "sent" in text.lower():
+                                return {"success": True}
+                            return {"success": False, "error": f"Unexpected response: {text[:100]}"}
+                    elif resp.status == 401 or resp.status == 403:
+                        # Session expired, clear cache and retry once
+                        print("[AgencyZoom SMS] Session expired, refreshing...")
+                        self._cached_cookies = None
+                        self._cached_csrf = None
+                        cookies = await self._get_cookies()
+                        if not cookies:
+                            return {"success": False, "error": "Could not refresh session"}
+                        # Retry with new cookies
+                        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                        headers["Cookie"] = cookie_str
+                        if self._cached_csrf:
+                            headers["X-CSRF-Token"] = self._cached_csrf
 
-            # Step 4: Enter message
-            print("[AgencyZoom SMS] Entering message...")
-            escaped_message = message.replace("'", "\\'").replace("\n", "\\n")
-            await page.evaluate(f"""
-                () => {{
-                    const textarea = document.getElementById('textMessage')
-                        || document.querySelector('textarea[name="message"]')
-                        || document.querySelector('textarea');
-                    if (textarea) {{
-                        textarea.value = '{escaped_message}';
-                        textarea.focus();
-                        textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        textarea.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
-                }}
-            """)
-            await asyncio.sleep(1)
+                        async with session.post(
+                            "https://app.agencyzoom.com/integration/sms/send-text",
+                            headers=headers,
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        ) as retry_resp:
+                            retry_text = await retry_resp.text()
+                            if retry_resp.status == 200:
+                                return {"success": True}
+                            return {"success": False, "error": f"Retry failed: {retry_text[:100]}"}
+                    else:
+                        return {"success": False, "error": f"HTTP {resp.status}: {text[:100]}"}
 
-            # Step 5: Click Send button
-            print("[AgencyZoom SMS] Clicking Send...")
-            send_clicked = await page.evaluate("""
-                () => {
-                    const sendBtn = document.getElementById('send-text-btn')
-                        || document.querySelector('button[type="submit"]')
-                        || Array.from(document.querySelectorAll('button'))
-                            .find(btn => btn.textContent.toLowerCase().includes('send'));
-                    if (sendBtn) { sendBtn.click(); return true; }
-                    return false;
-                }
-            """)
-
-            if not send_clicked:
-                return {"success": False, "error": "Could not find Send button"}
-
-            # Wait for send to complete
-            await asyncio.sleep(3)
-
-            # Check for success/error indicators
-            error_el = await page.query_selector(".alert-danger, .toast-error, .error-message")
-            if error_el:
-                is_visible = await error_el.is_visible()
-                if is_visible:
-                    error_text = await error_el.inner_text()
-                    return {"success": False, "error": f"Send failed: {error_text}"}
-
-            print("[AgencyZoom SMS] SMS sent successfully!")
-            return {"success": True}
-
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
         except Exception as e:
             print(f"[AgencyZoom SMS] Error: {e}")
             return {"success": False, "error": str(e)}
-
-        finally:
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-            self.browser = None
-            self.playwright = None
