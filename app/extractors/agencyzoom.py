@@ -222,23 +222,38 @@ class AgencyZoomExtractor:
             await page.goto("https://app.agencyzoom.com/login", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(2)
 
-            # Fill login form - AgencyZoom uses LoginForm[username] and LoginForm[password]
-            email_field = await page.wait_for_selector(
-                "input[name='LoginForm[username]'], input[name='email'], input[type='email']",
-                timeout=30000
-            )
+            # Fill login form - try multiple selectors like extract() does
+            print("[AgencyZoom SMS] Looking for email field...")
+            email_field = None
+            for selector in ["input[name='LoginForm[username]']", "input[name='email']", "input[type='email']", "#email"]:
+                try:
+                    email_field = await page.wait_for_selector(selector, timeout=5000)
+                    if email_field:
+                        print(f"[AgencyZoom SMS] Found email field with: {selector}")
+                        break
+                except:
+                    continue
+
             if not email_field:
                 return {"success": False, "error": "Could not find email field"}
             await email_field.fill(email)
 
-            password_field = await page.query_selector(
-                "input[name='LoginForm[password]'], input[name='password'], input[type='password']"
-            )
+            # Find password field
+            password_field = None
+            for selector in ["input[name='LoginForm[password]']", "input[name='password']", "input[type='password']", "#password"]:
+                try:
+                    password_field = await page.query_selector(selector)
+                    if password_field:
+                        break
+                except:
+                    continue
+
             if not password_field:
                 return {"success": False, "error": "Could not find password field"}
             await password_field.fill(password)
 
             # Submit login
+            print("[AgencyZoom SMS] Submitting login...")
             await password_field.press("Enter")
             await asyncio.sleep(8)
 
